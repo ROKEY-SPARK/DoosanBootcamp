@@ -7,14 +7,10 @@
 // */
 
 #include "dsr_hardware2/dsr_hw_interface2.h"
+#include "dsr_hardware2/util.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
 
-// 토크 외력 정보를 위한 헤더 파일 include
-
-// #include "geometry_msgs/msg/vector3.hpp"
-
-
-// #include "dsr_hardware2/dsr_connection_node2.h" // 이것의 역할은 모르겠음
+// #include "dsr_hardware2/dsr_connection_node2.h"
 #include <boost/thread/thread.hpp>
 #include <boost/assign/list_of.hpp>
 #include <boost/bind.hpp>
@@ -25,12 +21,17 @@
 #include <yaml-cpp/yaml.h>
 #include <fstream>
 
+#include <iostream>
+#include <chrono>
+
 #include <unistd.h>     
 #include <math.h>
 #include "../../dsr_common2/include/DRFLEx.h"
+using namespace std;
+using namespace chrono;
 using namespace DRAFramework;
 rclcpp::Node::SharedPtr s_node_ = nullptr;
-rclcpp::Node::SharedPtr m_node_ = nullptr; //ROS2
+rclcpp::Node::SharedPtr m_node_ = nullptr;
 CDRFLEx Drfl;
 //TODO Serial_comm ser_comm;
 sensor_msgs::msg::JointState msg;
@@ -39,19 +40,15 @@ bool g_bHasControlAuthority = FALSE;
 bool g_bTpInitailizingComplted = FALSE;
 bool g_bHommingCompleted = FALSE;
 
-ROBOT_JOINT_DATA g_joints[NUM_JOINT];
-
 DR_STATE    g_stDrState;
 DR_ERROR    g_stDrError;
 
-int g_nAnalogOutputModeCh1;
-int g_nAnalogOutputModeCh2;
 int m_nVersionDRCF;
-
+bool init_state=TRUE;
 
 int nDelay = 5000;
 #define STABLE_BAND_JNT     0.05
-#define DSR_CTL_PUB_RATE    100  //[hz] 10ms <----- 퍼블리싱 주기, but OnMonitoringDataCB() 은 100ms 마다 불려짐을 유의!   
+
 void* get_drfl(){
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"[DRFL address] %p", &Drfl);
     return &Drfl;
@@ -59,7 +56,7 @@ void* get_drfl(){
 void* get_s_node_(){
     return &s_node_;
 }
-
+auto startTime = steady_clock::now(); // 프로그램 시작 시간 기록
 bool init_check = true;
 
 void threadFunction() {
@@ -120,6 +117,10 @@ void threadFunction() {
         m_mobile = yaml_node["mobile"].as<std::string>();
         RCLCPP_INFO(s_node_->get_logger(), "mobile: %s", m_mobile.c_str());
     }
+    if (yaml_node["rt_host"]) {
+        m_rt_host = yaml_node["rt_host"].as<std::string>();
+        RCLCPP_INFO(s_node_->get_logger(), "rt_host: %s", m_rt_host.c_str());
+    }
 }
 
 
@@ -132,7 +133,6 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     {
         return CallbackReturn::ERROR;
     }
-    sleep(8);
 
     // robot has 6 joints and 2 interfaces
     joint_position_.assign(6, 0);
@@ -140,52 +140,141 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     joint_position_command_.assign(6, 0);
     joint_velocities_command_.assign(6, 0);
 
+    if(6 != info_.joints.size()) {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), 
+            "[on_init] Hardware joint size : %zu, expected : 6", info.joints.size());
+        return CallbackReturn::ERROR;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), 
+            "[on_init] Hardware name : %s, type : %s, class type : %s",
+            info_.name.c_str(), info_.type.c_str(), info_.hardware_class_type.c_str());
+
     for (const auto & joint : info_.joints)
     {
+        RCLCPP_DEBUG(rclcpp::get_logger("dsr_hw_interface2"), 
+            "[on_init] joint name : %s, type : %s,",
+            joint.name.c_str(), joint.type.c_str());
         for (const auto & interface : joint.state_interfaces)
         {
-        joint_interfaces[interface.name].push_back(joint.name);
+            RCLCPP_DEBUG(rclcpp::get_logger("dsr_hw_interface2"), 
+                "[on_init] joint state interface name : %s ", 
+                interface.name.c_str());
+						if(interface.name == "effort") {
+							RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), 
+								"[on_init] Not Implemented effort interface.. ignored");
+							continue;
+						}
+            joint_interfaces[interface.name].push_back(joint.name);
+        }
+        for (const auto & interface : joint.command_interfaces)
+        {
+            RCLCPP_DEBUG(rclcpp::get_logger("dsr_hw_interface2"), 
+                "[on_init] joint command_interfaces name : %s ", 
+                interface.name.c_str());
+							if(interface.name == "effort") {
+								RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), 
+										"[on_init] Not Implemented effort interface.. ignored");
+								continue;
+							}
+            joint_comm_interfaces[interface.name].push_back(joint.name);
         }
     }
-    
-    auto joint_names = {
-        "joint_1",
-        "joint_2",
-        "joint_3",
-        "joint_4",
-        "joint_5",
-        "joint_6",
-    };
 
-    size_t i = 0;
-    for (auto & joint_name : joint_names)
-    {
-        // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"joint_name = %s", joint_name);
-        ++i;
-    }
+    // TODO(Song-ms, leeminju): This thread is present for parameter reading... 
+    //? Parameter concept is proper for hardware interface ? (Interface doesn't inherit node.
     std::thread t(threadFunction);
     t.join(); // need to make sure termination of the thread.
 
-
-
-
 //-----------------------------------------------------------------------------------------------------
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    INITAILIZE");
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");
     
+    //------------------------------------------------------------------------------
+    // await for values from ros parameters
+    while(m_host == "") //! attached handling with above thread.
+    {
+        usleep(nDelay);
+    }
+
+    // Try to connect to DRCF for 10 (20 * 0.5) sec. 
+    bool is_connected = false;
+    for (size_t retry = 0; retry < 20; ++retry) {
+        is_connected = Drfl.open_connection(m_host, m_port);
+        if(!is_connected) {
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"Connecting failure.. retry...");
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"Connected to DRCF");
+        break;
+    }
+    if(!is_connected)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"),"    DSRInterface::init() DRCF connecting ERROR!!!");
+        return CallbackReturn::ERROR;
+    }
+    // Check whether DRCF loaded successfully for 10 sec..
+    // Even thought, the server connected,
+    // The drcf could still be in the booting process. 
+    // Need to make sure it loaded successfully.
+    // By making sure AUTHORITY and STANDBY_STATE.
+    static bool get_control_access = false;
+    static bool is_standby = false;
+    Drfl.set_on_monitoring_access_control([](const MONITORING_ACCESS_CONTROL access) {
+        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"AUTHORITY : %s", to_str(access).c_str());
+        if(MONITORING_ACCESS_CONTROL_GRANT == access) {
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"INITIAL AUTHORITY GRANTED !!!");
+            get_control_access = true;
+            is_standby = false; // previous standby state before getting authority is definitely useless.
+        }
+        if(MONITORING_ACCESS_CONTROL_LOSS == access) {
+            get_control_access = false;
+            is_standby = false; // previous standby state after losing authority is definitely useless.
+        }
+    });
+    Drfl.set_on_monitoring_state([](const ROBOT_STATE state) {
+        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"ROBOT_STATE : %s", to_str(state).c_str());
+        if(STATE_STANDBY == state) {
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"INITIAL STATE_STANDBY !!!");
+            is_standby = true;
+        }else {
+            is_standby = false;
+        }
+    });
+    for (size_t retry = 0; retry < 10; ++retry, std::this_thread::sleep_for(std::chrono::milliseconds(1000))) {
+        if(!get_control_access) {
+            Drfl.ManageAccessControl(MANAGE_ACCESS_CONTROL_FORCE_REQUEST);
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"INITIAL MANAGE_ACCESS_CONTROL_FORCE_REQUEST called");
+            continue;
+        }
+        if(!is_standby) {
+            Drfl.set_robot_control(CONTROL_SERVO_ON);
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"INITIAL CONTROL_SERVO_ON called");
+            continue;
+        }
+        if(get_control_access && is_standby)   break;
+    }
+    if(!(get_control_access && is_standby)) {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"),"INITIAL STATE CALL FAILURE !!");
+        return CallbackReturn::ERROR;
+    }
 
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n"); 
-    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    INITAILIZE");
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    OPEN CONNECTION");
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n"); 
+
     //--- doosan API's call-back fuctions : Only work within 50msec in call-back functions
-    Drfl.set_on_tp_initializing_completed(DSRInterface::OnTpInitializingCompletedCB);
+    Drfl.set_on_tp_initializing_completed(DSRInterface::OnTpInitializingCompletedCB);//RELATED TO LOGIC -> seems to be deleted.
     Drfl.set_on_homming_completed(DSRInterface::OnHommingCompletedCB);
     Drfl.set_on_program_stopped(DSRInterface::OnProgramStoppedCB);
     Drfl.set_on_monitoring_modbus(DSRInterface::OnMonitoringModbusCB);
     Drfl.set_on_monitoring_data(DSRInterface::OnMonitoringDataCB);           // Callback function in M2.4 and earlier
     Drfl.set_on_monitoring_ctrl_io(DSRInterface::OnMonitoringCtrlIOCB);       // Callback function in M2.4 and earlier
-    Drfl.set_on_monitoring_state(DSRInterface::OnMonitoringStateCB);
-    Drfl.set_on_monitoring_access_control(DSRInterface::OnMonitoringAccessControlCB);
+    Drfl.set_on_monitoring_state(DSRInterface::OnMonitoringStateCB);//RELATED TO LOGIC
+    Drfl.set_on_monitoring_access_control(DSRInterface::OnMonitoringAccessControlCB);//RELATED TO LOGIC
     Drfl.set_on_log_alarm(DSRInterface::OnLogAlarm);
-    
+
     m_node_ = rclcpp::Node::make_shared("dsr_hw_interface_update");
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_default));
     m_joint_state_pub_ = m_node_->create_publisher<sensor_msgs::msg::JointState>("joint_states", qos);
@@ -195,124 +284,156 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     joint_state_pub_ = m_node_->create_publisher<std_msgs::msg::Float64MultiArray>("msg/joint_state", qos);
     // Current PosX 관련 퍼블리셔
     current_posx_pub_ = m_node_->create_publisher<std_msgs::msg::Float64MultiArray>("msg/current_posx", qos);
+    
+    //--- connect Emulator ? ------------------------------    
+    if(m_host == "127.0.0.1") g_bIsEmulatorMode = true; 
+    else                    g_bIsEmulatorMode = false;
 
+    //--- Get version -------------------------------------            
+    SYSTEM_VERSION tSysVerion;
+    memset(&tSysVerion, 0, sizeof(tSysVerion));
+    assert(Drfl.get_system_version(&tSysVerion));
 
+    //--- Get DRCF version & convert to integer  ----------            
+    m_nVersionDRCF = 0; 
+    int k=0;
+    for(int i=strlen(tSysVerion._szController); i>0; i--)
+        if(tSysVerion._szController[i]>='0' && tSysVerion._szController[i]<='9')
+            m_nVersionDRCF += (tSysVerion._szController[i]-'0')*pow(10.0,k++);
+    if(m_nVersionDRCF < 100000) m_nVersionDRCF += 100000; 
 
-    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "Tool force publisher initialized.");
+    if(g_bIsEmulatorMode) RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    Emulator Mode");
+    else                  RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    Real Robot Mode");
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    DRCF version = %s",tSysVerion._szController);
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    DRFL version = %s",Drfl.get_library_version());
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    m_nVersionDRCF = %d", m_nVersionDRCF);  //ex> M2.40 = 120400, M2.50 = 120500  
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");   
 
-
-    //------------------------------------------------------------------------------
-    // await for values from ros parameters
-    while(m_host == "")
-    {
-        usleep(nDelay);
-    }
-    if(Drfl.open_connection(m_host, m_port))
-    {
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n"); 
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    OPEN CONNECTION");
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");   
-
-        //--- connect Emulator ? ------------------------------    
-        if(m_host == "127.0.0.1") g_bIsEmulatorMode = true; 
-        else                    g_bIsEmulatorMode = false;
-
-        //--- Get version -------------------------------------            
-        SYSTEM_VERSION tSysVerion = {'\0', };
-        assert(Drfl.get_system_version(&tSysVerion));
-
-        //--- Get DRCF version & convert to integer  ----------            
-        m_nVersionDRCF = 0; 
-        int k=0;
-        for(int i=strlen(tSysVerion._szController); i>0; i--)
-            if(tSysVerion._szController[i]>='0' && tSysVerion._szController[i]<='9')
-                m_nVersionDRCF += (tSysVerion._szController[i]-'0')*pow(10.0,k++);
-        if(m_nVersionDRCF < 100000) m_nVersionDRCF += 100000; 
-
-        if(g_bIsEmulatorMode) RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    Emulator Mode");
-        else                  RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    Real Robot Mode");
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    DRCF version = %s",tSysVerion._szController);
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    DRFL version = %s",Drfl.get_library_version());
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    m_nVersionDRCF = %d", m_nVersionDRCF);  //ex> M2.40 = 120400, M2.50 = 120500  
-        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");   
-
-        if(m_nVersionDRCF >= 120500)    //M2.5 or later        
+        if(m_nVersionDRCF >= 120500 && m_nVersionDRCF < 3000000)    //M2.5 or later        
         {
             Drfl.set_on_monitoring_data_ex(DSRInterface::OnMonitoringDataExCB);      //Callback function in version 2.5 and higher
-            Drfl.set_on_monitoring_ctrl_io_ex(DSRInterface::OnMonitoringCtrlIOExCB);  //Callback function in version 2.5 and higher                     
+            // Drfl.set_on_monitoring_ctrl_io_ex(DSRInterface::OnMonitoringCtrlIOExCB);  //Callback function in version 2.5 and higher                     
+            Drfl.setup_monitoring_version(1);                        //Enabling extended monitoring functions 
+        }
+        else if(m_nVersionDRCF >= 3000000)
+        {
+            Drfl.set_on_monitoring_data_ex(DSRInterface::OnMonitoringDataExCB);      //Callback function in version 2.5 and higher
+            // Drfl.set_on_monitoring_ctrl_io_ex(DSRInterface::OnMonitoringCtrlIOEx2CB);  //Callback function in version 2.5 and higher                     
             Drfl.setup_monitoring_version(1);                        //Enabling extended monitoring functions 
         }
 
-        //--- Check Robot State : STATE_STANDBY ---               
-        while ((Drfl.GetRobotState() != STATE_STANDBY)){
-            usleep(nDelay);
-        }
-
-        //--- Set Robot mode : MANUAL or AUTO
-        assert(Drfl.SetRobotMode(ROBOT_MODE_AUTONOMOUS));
-
-        //--- Set Robot mode : virual or real 
-        ROBOT_SYSTEM eTargetSystem = ROBOT_SYSTEM_VIRTUAL;
-        if(m_mode == "real") eTargetSystem = ROBOT_SYSTEM_REAL;
-        assert(Drfl.SetRobotSystem(eTargetSystem));
-
-        // to compare with g_joints[].cmd
-        for(int i = 0; i < NUM_JOINT; i++){
-            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    [init]::read %d-pos: %7.3f", i, g_joints[i].cmd);
-            m_fCmd_[i] = g_joints[i].cmd;
-        }
-
-        return CallbackReturn::SUCCESS;
+    //--- Check Robot State : STATE_STANDBY ---               
+    while ((Drfl.GetRobotState() != STATE_STANDBY)){
+        usleep(nDelay);
     }
-    RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"),"    DSRInterface::init() DRCF connecting ERROR!!!");
 
-  return CallbackReturn::ERROR;
-// return CallbackReturn::SUCCESS;
+    //--- Set Robot mode : MANUAL or AUTO
+    if(!Drfl.SetRobotMode(ROBOT_MODE_AUTONOMOUS)) {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), "ROBOT_MODE_AUTONOMOUS Setting Failure !!"); 
+        return CallbackReturn::ERROR;
+    }
+
+    //--- Set Robot mode : virual or real 
+    ROBOT_SYSTEM eTargetSystem = ROBOT_SYSTEM_VIRTUAL;
+    if(m_mode == "real") eTargetSystem = ROBOT_SYSTEM_REAL;
+    if(!Drfl.SetRobotSystem(eTargetSystem)) {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), "SetRobotSystem {%s} Setting Failure !!",
+            m_mode.c_str()); 
+        return CallbackReturn::ERROR;
+    }
+
+    // Basically, Controller automatically servo-off after elapse time (5 min)
+    // Deactivate it.
+    Drfl.set_auto_servo_off(0, 5.0);
+
+    // Virtual controller doesn't support real time connection.
+    if(m_mode != "virtual") {
+        if(m_nVersionDRCF >= 3000000) {
+            m_host = m_rt_host;
+        }
+        if (!Drfl.connect_rt_control(m_host)) {
+            RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), "Unable to connect RT control stream");
+            return CallbackReturn::FAILURE;
+        }
+        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "Connected RT control stream");
+        const std::string version   = "v1.0";
+        const float       period    = 0.001;
+        const int         losscount = 4;
+        if (!Drfl.set_rt_control_output(version, period, losscount)) {
+            RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), "Unable to connect RT control stream");
+            return CallbackReturn::FAILURE;
+        }
+
+        if (!Drfl.start_rt_control()) {
+            RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), "Unable to start RT control");
+            return CallbackReturn::FAILURE;
+        }
+
+        RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "Setting velocity and acceleration limits");
+        float limit[6] = {70.0f,70.0f,70.0f,70.0f,70.0f,70.0f};
+        if (!Drfl.set_velj_rt(limit)) return CallbackReturn::ERROR;
+        if (!Drfl.set_accj_rt(limit)) return CallbackReturn::ERROR;
+    }
+    
+    Drfl.set_safety_mode(SAFETY_MODE_AUTONOMOUS,SAFETY_MODE_EVENT_MOVE);
+    return CallbackReturn::SUCCESS;
 }
 
 std::vector<hardware_interface::StateInterface> DRHWInterface::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
+    // std::vector<size_t> sorted_indices(joint_interfaces["position"].size());
+    // std::iota(sorted_indices.begin(), sorted_indices.end(), 0);  // 0, 1, 2, ..., N-1
 
-  int ind = 0;
-  for (const auto & joint_name : joint_interfaces["position"])
-  {
-    cout << "[callback StateInterface] StateInterface state_interfaces: " << joint_position_[ind] << endl;
+    // std::sort(sorted_indices.begin(), sorted_indices.end(), [&](size_t i, size_t j) {
+    //     std::string name_i = joint_interfaces["position"][i];
+    //     std::string name_j = joint_interfaces["position"][j];
 
-    state_interfaces.emplace_back(joint_name, "position", &joint_position_[ind++]);
-  }
+    //     int num_i = std::stoi(name_i.substr(name_i.find("_") + 1));
+    //     int num_j = std::stoi(name_j.substr(name_j.find("_") + 1));
 
-  ind = 0;
-  for (const auto & joint_name : joint_interfaces["velocity"])
-  {
-    state_interfaces.emplace_back(joint_name, "velocity", &joint_velocities_[ind++]);
-  }
+    //     return num_i < num_j;  // 숫자 크기 순으로 정렬
+    // });
 
+    // std::cout << "🔹 Sorted Joint Names: ";
+    // for (size_t i : sorted_indices) {
+    //     std::cout << joint_interfaces["position"][i] << " ";
+    // }
+    // std::cout << "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"<< std::endl;
+
+	for(size_t i=0; i<joint_interfaces["position"].size(); i++) {
+		state_interfaces.emplace_back(joint_interfaces["position"][i], "position", &joint_position_[i]);
+	}
+	// TODO(songms, leeminju) support velocity control.
+    for(size_t i=0; i<joint_interfaces["velocity"].size(); i++) {
+		state_interfaces.emplace_back(joint_interfaces["velocity"][i], "velocity", &joint_velocities_[i]);
+	}
+	// TODO(songms, leeminju) support effort control.
+	for(size_t i=0; i<joint_interfaces["effort"].size(); i++) {
+		state_interfaces.emplace_back(joint_interfaces["effort"][i], "effort", &joint_effort_[i]);
+	}
   return state_interfaces;
 }
 
 std::vector<hardware_interface::CommandInterface> DRHWInterface::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
-
-  int ind = 0;
-  for (const auto & joint_name : joint_interfaces["position"])
-  {
-    cout << "[callback CommandInterface] CommandInterface joint_position_command_: " << joint_position_command_[ind] << endl;
-    command_interfaces.emplace_back(joint_name, "position", &joint_position_command_[ind++]);
-  }
-
-  ind = 0;
-  for (const auto & joint_name : joint_interfaces["velocity"])
-  {
-    command_interfaces.emplace_back(joint_name, "velocity", &joint_velocities_command_[ind++]);
-  }
-
+    pre_joint_position_command_ = joint_position_command_;
+	for(size_t i=0; i<joint_comm_interfaces["position"].size(); i++) {
+		command_interfaces.emplace_back(joint_comm_interfaces["position"][i], "position", &joint_position_command_[i]);
+	}
+	for(size_t i=0; i<joint_comm_interfaces["velocity"].size(); i++) {
+		command_interfaces.emplace_back(joint_comm_interfaces["velocity"][i], "velocity", &joint_velocities_command_[i]);
+	}
+	// TODO(songms, leeminju) support effort control.
+	for(size_t i=0; i<joint_comm_interfaces["effort"].size(); i++) {
+		command_interfaces.emplace_back(joint_comm_interfaces["effort"][i], "effort", &joint_effort_command_[i]);
+	}
   return command_interfaces;
 }
 
 
-return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
     double now_sec = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     long int now_ns;
@@ -328,21 +449,30 @@ return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Dur
     msg.name.push_back("joint_4");
     msg.name.push_back("joint_5");
     msg.name.push_back("joint_6");
-    LPROBOT_POSE pose = Drfl.GetCurrentPose();
-    // for (int i = 0; i < 6; i++){
-    //     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), " : %.2f", pose->_fPosition[i]);
-    // }
-    for (auto i = 0ul; i < joint_velocities_command_.size(); i++)
-    {
-        joint_velocities_[i] = joint_velocities_command_[i];
-        joint_position_[i] += joint_velocities_command_[i] * period.seconds();
+
+    if(m_mode == "real") {
+        const LPRT_OUTPUT_DATA_LIST data = Drfl.read_data_rt();
+        for(int i=0;i<6;i++) {
+            joint_position_[i] = static_cast<float>(data->actual_joint_position[i] * (M_PI / 180.0f));
+            joint_velocities_[i] = static_cast<float>(data->actual_joint_velocity[i] * (M_PI / 180.0f));
+        }
+    }else if(m_mode == "virtual") {
+        LPROBOT_POSE pose = Drfl.GetCurrentPose();
+        if(nullptr == pose) {
+        RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"),
+                    "[read] GetCurrentPose retrieves nullptr");
+        return return_type::ERROR; //? what effection of this to control node 
+        }
+        for(int i=0;i<6;i++){
+            joint_position_[i] = deg2rad(pose->_fPosition[i]);
+        }
+    }else {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), 
+            "'mode' is neither 'real' nor 'virtual.'" );
     }
-    for (auto i = 0ul; i < joint_position_command_.size(); i++)
-    {
-        joint_position_[i] = joint_position_command_[i];
-        
-        g_joints[i].pos = deg2rad(pose->_fPosition[i]);
-        msg.position.push_back(g_joints[i].pos);
+
+    for (int i=0;i<6;i++){
+        msg.position.push_back(joint_position_[i]);
         msg.velocity.push_back(0);
         msg.effort.push_back(0);
     }
@@ -351,24 +481,88 @@ return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Dur
     msg.velocity.clear();
     msg.effort.clear();
     msg.name.clear();
+    // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "[READ] joint_position_  : {%.3f, %.3f, %.3f, %.3f, %.3f, %.3f}"
+    //     ,joint_position_[0]
+    //     ,joint_position_[1]
+    //     ,joint_position_[2]
+    //     ,joint_position_[3]
+    //     ,joint_position_[4]
+    //     ,joint_position_[5]);
   return return_type::OK;
 }
 
-return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &)
+bool positionCommandRunning(const std::vector<double>& lhs, const std::vector<double>& rhs) {
+    double var = 0;
+    for(size_t i=0; i<lhs.size(); i++) {
+        var += abs(lhs[i] - rhs[i]);
+    }
+    return var >= 0.0001;
+}
+
+vector<vector<float>> joint_position_commands;
+return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &dt)
 {
-  return return_type::OK;
+    // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "[WRITE] dt  : %.3f", float(dt.seconds()) );
+    // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "[WRITE] joint_position_command_  : {%.3f, %.3f, %.3f, %.3f, %.3f, %.3f}"
+    //         ,joint_position_command_[0]
+    //         ,joint_position_command_[1]
+    //         ,joint_position_command_[2]
+    //         ,joint_position_command_[3]
+    //         ,joint_position_command_[4]
+    //         ,joint_position_command_[5]);
+    // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "[WRITE] joint_velocities_command_  : {%.3f, %.3f, %.3f, %.3f, %.3f, %.3f}"
+    //         ,joint_velocities_command_[0]
+    //         ,joint_velocities_command_[1]
+    //         ,joint_velocities_command_[2]
+    //         ,joint_velocities_command_[3]
+    //         ,joint_velocities_command_[4]
+    //         ,joint_velocities_command_[5]);
+    static bool idle = false;
+    // TODO: this seems to be a workaround. refer to hardware design of 'prepare_command_mode_switch'
+    if(positionCommandRunning(pre_joint_position_command_, joint_position_command_)) {
+        if(true == idle) {
+            // This is workaround to overcome issues :
+            // move_joint (drfl) API internally sent safety_off right after moving. 
+            // which occurs problems like :
+            // "move_joint service command -> trajectory command => error ! "
+            Drfl.set_safety_mode(SAFETY_MODE_AUTONOMOUS,SAFETY_MODE_EVENT_MOVE);
+            idle = false;
+        }
+
+        float pos[6];
+        float targetVel[6];
+        for(int i=0;i<6;i++) {
+            pos[i] = static_cast<float>(joint_position_command_[i] * (180.0f / M_PI));
+            targetVel[i] = static_cast<float>(joint_velocities_command_[i] * (180.0f / M_PI));
+        }
+        if(m_mode == "real") {
+            float margin = 1.5; // Setted margin since most host aren't RT. 
+            float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // Complied with internal profile.
+            Drfl.servoj_rt(pos, targetVel, acc, float(dt.seconds() * margin));
+        }
+        else { // "virtual"
+            float target_vel_acc[6] = {70.0f, 70.0f, 70.0f, 70.0f, 70.0f, 70.0f};
+            Drfl.amovej(pos, target_vel_acc, target_vel_acc); // Workaround. needed updated.
+        }
+        pre_joint_position_command_ = joint_position_command_;
+        return return_type::OK;
+    }
+    idle = true;
+    pre_joint_position_command_ = joint_position_command_;
+    return return_type::OK;
 }
 
 DRHWInterface::~DRHWInterface()
 {
     Drfl.close_connection();
+    Drfl.disconnect_rt_control();
 
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n"); 
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    CONNECTION IS CLOSED");
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n"); 
 }
 
-}  
+}
 
 
 const char* GetRobotStateString(int nState)
@@ -419,10 +613,10 @@ int IsInposition(double dCurPosDeg[], double dCmdPosDeg[])
 void DSRInterface::OnTpInitializingCompletedCB()
 {
     // request control authority after TP initialized
-    cout << "[callback OnTpInitializingCompletedCB] tp initializing completed" << endl;
+    // cout << "[callback OnTpInitializingCompletedCB] tp initializing completed" << endl;
     g_bTpInitailizingComplted = TRUE;
     //Drfl.manage_access_control(MANAGE_ACCESS_CONTROL_REQUEST);
-    Drfl.manage_access_control(MANAGE_ACCESS_CONTROL_FORCE_REQUEST);
+    // Drfl.manage_access_control(MANAGE_ACCESS_CONTROL_FORCE_REQUEST);
 
     g_stDrState.bTpInitialized = TRUE;
 }
@@ -432,14 +626,14 @@ void DSRInterface::OnHommingCompletedCB()
 {
     g_bHommingCompleted = TRUE;
     // Only work within 50msec
-    cout << "[callback OnHommingCompletedCB] homming completed" << endl;
+    // cout << "[callback OnHommingCompletedCB] homming completed" << endl;
 
     g_stDrState.bHommingCompleted = TRUE;
 }
 
-void DSRInterface::OnProgramStoppedCB(const PROGRAM_STOP_CAUSE iStopCause)
+void DSRInterface::OnProgramStoppedCB(const PROGRAM_STOP_CAUSE /*iStopCause*/)
 {
-    cout << "[callback OnProgramStoppedCB] Program Stop: " << (int)iStopCause << endl;
+    // cout << "[callback OnProgramStoppedCB] Program Stop: " << (int)iStopCause << endl;
     g_stDrState.bDrlStopped = TRUE;
 }
 // M2.4 or lower
@@ -452,6 +646,36 @@ void DSRInterface::OnMonitoringCtrlIOCB (const LPMONITORING_CTRLIO pCtrlIO)
         }
     }
 }
+
+// M3.0 or higher
+// void DSRInterface::OnMonitoringCtrlIOEx2CB (const LPMONITORING_CTRLIO_EX2 pCtrlIO) 
+// {
+//     //RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"DSRInterface::OnMonitoringCtrlIOExCB");
+
+//     for (int i = 0; i < NUM_DIGITAL; i++){
+//         if(pCtrlIO){  
+//             g_stDrState.bCtrlBoxDigitalOutput[i] = pCtrlIO->_tOutput._iTargetDO[i];  
+//             g_stDrState.bCtrlBoxDigitalInput[i]  = pCtrlIO->_tInput._iActualDI[i];  
+//         }
+//     }
+
+//     //----- In M3.0 version or higher The following variables were added -----
+//     for (int i = 0; i < 3; i++)
+//         g_stDrState.bActualSW[i] = pCtrlIO->_tInput._iActualSW[i];
+
+//     for (int i = 0; i < 2; i++){
+//         g_stDrState.bActualSI[i] = pCtrlIO->_tInput._iActualSI[i];
+//         g_stDrState.fActualAI[i] = pCtrlIO->_tInput._fActualAI[i];
+//         g_stDrState.iActualAT[i] = pCtrlIO->_tInput._iActualAT[i];
+//         g_stDrState.fTargetAO[i] = pCtrlIO->_tOutput._fTargetAO[i];
+//         g_stDrState.iTargetAT[i] = pCtrlIO->_tOutput._iTargetAT[i];
+//         g_stDrState.bActualES[i] = pCtrlIO->_tEncoder._iActualES[i];
+//         g_stDrState.iActualED[i] = pCtrlIO->_tEncoder._iActualED[i];
+//         g_stDrState.bActualER[i] = pCtrlIO->_tEncoder._iActualER[i];
+//     }  
+//     //-------------------------------------------------------------------------
+// }
+
 // M2.5 or higher
 void DSRInterface::OnMonitoringCtrlIOExCB (const LPMONITORING_CTRLIO_EX pCtrlIO) 
 {
@@ -486,7 +710,7 @@ void DSRInterface::OnMonitoringDataCB(const LPMONITORING_DATA pData)
 {
     // This function is called every 100 msec
     // Only work within 50msec
-    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"DSRInterface::OnMonitoringDataCB");
+    //RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"DSRInterface::OnMonitoringDataCB");
 
     g_stDrState.nActualMode  = pData->_tCtrl._tState._iActualMode;                  // position control: 0, torque control: 1 ?????
     g_stDrState.nActualSpace = pData->_tCtrl._tState._iActualSpace;                 // joint space: 0, task space: 1    
@@ -541,7 +765,6 @@ void DSRInterface::OnMonitoringDataCB(const LPMONITORING_DATA pData)
             g_stDrState.bFlangeDigitalOutput[i] = pData->_tMisc._iActualDO[i];      // Digital output data
         }
     }
-
 }
 
 // M2.5 or higher    
@@ -634,21 +857,10 @@ void DSRInterface::OnMonitoringDataExCB(const LPMONITORING_DATA_EX pData)
 
     g_stDrState.iActualUCN = pData->_tCtrl._tUser._iActualUCN;
     g_stDrState.iParent    = pData->_tCtrl._tUser._iParent;
-
-    // 
-// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-// @@@@@@@@@@@  User Defined Robot State info Pulisher  @@@@@@@@@@@@@@
-// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-
-
-
+    //-------------------------------------------------------------------------
     // Tool Force Publisher
     auto tool_force_msg = std_msgs::msg::Float64MultiArray();
     tool_force_msg.data.resize(6);
-
     for (int i = 0; i < NUM_JOINT; i++){
 
         if(pData){
@@ -656,14 +868,11 @@ void DSRInterface::OnMonitoringDataExCB(const LPMONITORING_DATA_EX pData)
             tool_force_msg.data[i] = pData->_tCtrl._tUser._fActualETT[i];
         }    
     }
-
     tool_force_pub_ -> publish(tool_force_msg);    
 
     // Joint State Publisher
     auto joint_state_msg = std_msgs::msg::Float64MultiArray();
-
     joint_state_msg.data.resize(6);
-
     for (int i = 0; i < NUM_JOINT; i++){
 
         if(pData){
@@ -671,38 +880,25 @@ void DSRInterface::OnMonitoringDataExCB(const LPMONITORING_DATA_EX pData)
             joint_state_msg.data[i] = pData->_tCtrl._tJoint._fActualPos[i];
         }    
     }
-
-    joint_state_pub_ -> publish(joint_state_msg);    
-
+    joint_state_pub_ -> publish(joint_state_msg);
 
     // Current
-
     auto current_posx_msg = std_msgs::msg::Float64MultiArray();
-    
     current_posx_msg.data.resize(6);
-
     for (int i = 0; i < NUM_JOINT; i++){
-
         if(pData){
             g_stDrState.fTargetPosx[i]  = pData->_tCtrl._tTask._fTargetPos[i];
             current_posx_msg.data[i] = pData->_tCtrl._tTask._fTargetPos[i];
         }    
     }
-
     current_posx_pub_ -> publish(current_posx_msg);    
-    
-
-
-
-
-//-------------------------------------------------------------------------
 }
 
 void DSRInterface::OnMonitoringModbusCB (const LPMONITORING_MODBUS pModbus)
 {
     g_stDrState.nRegCount = pModbus->_iRegCount;
     for (int i = 0; i < pModbus->_iRegCount; i++){
-        cout << "[callback OnMonitoringModbusCB] " << pModbus->_tRegister[i]._szSymbol <<": " << pModbus->_tRegister[i]._iValue<< endl;
+        // cout << "[callback OnMonitoringModbusCB] " << pModbus->_tRegister[i]._szSymbol <<": " << pModbus->_tRegister[i]._iValue<< endl;
         g_stDrState.strModbusSymbol[i] = pModbus->_tRegister[i]._szSymbol;
         g_stDrState.nModbusValue[i]    = pModbus->_tRegister[i]._iValue;
     }
@@ -736,13 +932,17 @@ void DSRInterface::OnMonitoringStateCB(const ROBOT_STATE eState)
         if (g_bHasControlAuthority) {
             Drfl.set_safe_stop_reset_type(SAFE_STOP_RESET_TYPE_DEFAULT);
             Drfl.set_robot_control(CONTROL_RESET_SAFET_STOP);
-            Drfl.set_safety_mode(SAFETY_MODE_AUTONOMOUS,SAFETY_MODE_EVENT_MOVE);
+            // Drfl.set_safety_mode(SAFETY_MODE_AUTONOMOUS,SAFETY_MODE_EVENT_MOVE);
         }
         break;
     case STATE_SAFE_OFF:
         if (g_bHasControlAuthority){
+            if (init_state){
             Drfl.set_robot_control(CONTROL_SERVO_ON);
             Drfl.set_robot_mode(ROBOT_MODE_AUTONOMOUS);   //Idle Servo Off 후 servo on 하는 상황 발생 시 set_robot_mode 명령을 전송해 manual 로 전환. add 2020/04/28
+            // Drfl.set_safety_mode(SAFETY_MODE_AUTONOMOUS,SAFETY_MODE_EVENT_MOVE);
+            init_state = FALSE;
+            }
         } 
         break;
     case STATE_SAFE_STOP2:
@@ -760,7 +960,7 @@ void DSRInterface::OnMonitoringStateCB(const ROBOT_STATE eState)
         break;
     }
 
-    cout << "[callback OnMonitoringStateCB] current state: " << GetRobotStateString((int)eState) << endl;
+    // cout << "[callback OnMonitoringStateCB] current state: " << GetRobotStateString((int)eState) << endl;
     g_stDrState.nRobotState = (int)eState;
     strncpy(g_stDrState.strRobotState, GetRobotStateString((int)eState), MAX_SYMBOL_SIZE); 
 }
@@ -769,7 +969,7 @@ void DSRInterface::OnMonitoringAccessControlCB(const MONITORING_ACCESS_CONTROL e
 {
     // Only work within 50msec
 
-    cout << "[callback OnMonitoringAccessControlCB] eAccCtrl: " << eAccCtrl << endl;
+    // cout << "[callback OnMonitoringAccessControlCB] eAccCtrl: " << eAccCtrl << endl;
     switch(eAccCtrl)
     {
     case MONITORING_ACCESS_CONTROL_REQUEST:
@@ -862,3 +1062,4 @@ void DSRInterface::OnLogAlarm(LPLOG_ALARM pLogAlarm)
 PLUGINLIB_EXPORT_CLASS(
   dsr_hardware2::DRHWInterface, hardware_interface::SystemInterface)
       
+
