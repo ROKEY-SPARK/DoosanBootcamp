@@ -1,28 +1,36 @@
 
 from langchain.chat_models import ChatOpenAI
-
+import openai
+import sounddevice as sd
+import scipy.io.wavfile as wav
+import numpy as np
+import tempfile
 
 class STT:
     def __init__(self, openai_api_key):
-        self.stt = ChatOpenAI(
-            openai_api_key=openai_api_key,
-            model="gpt-4o-audio-preview",
-            temperature=0,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2
-        )
+        self.openai_api_key = openai_api_key
+        self.duration = 5  # seconds
+        self.samplerate = 16000  # Whisper는 16kHz를 선호
 
-    def speech2text(self, speech_data):
-        messages = [
-            ("human", [
-                {"type": "text", "text": "Transcribe the following:"},
-                {"type": "input_audio", "input_audio": {"data": speech_data, "format": "wav"}},
-            ])
-        ]
 
-        output_message = self.stt.invoke(messages)
-        print("output_message.content: ", output_message.content)
-        return output_message
+    def speech2text(self):
+        # 녹음 설정
+        print("음성 녹음을 시작합니다. \n 5초 동안 말해주세요...")
+        audio = sd.rec(int(self.duration * self.samplerate), samplerate=self.samplerate, channels=1, dtype='int16')
+        sd.wait()
+        print("녹음 완료. Whisper에 전송 중...")
 
-    
+        # 임시 WAV 파일 저장
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+            wav.write(temp_wav.name, self.samplerate, audio)
+
+            # Whisper API 호출
+            with open(temp_wav.name, "rb") as f:
+                transcript = openai.Audio.transcribe(
+                    model="whisper-1",
+                    file=f,
+                    api_key=self.openai_api_key
+                )
+
+        print("STT 결과: ", transcript['text'])
+        return transcript['text']

@@ -10,16 +10,17 @@ from ultralytics import YOLO
 import numpy as np
 
 
-PACKAGE_NAME = 'pick_and_place_text'
+PACKAGE_NAME = "pick_and_place_text"
 PACKAGE_PATH = get_package_share_directory(PACKAGE_NAME)
 
-YOLO_MODEL_FILENAME = 'yolov8n_tools_0122.pt'
+YOLO_MODEL_FILENAME = "yolov8n_tools_0122.pt"
 YOLO_CLASS_NAME_JSON = "class_name_tool.json"
 
-YOLO_MODEL_PATH = os.path.join(PACKAGE_PATH, 'resource', YOLO_MODEL_FILENAME)
-YOLO_JSON_PATH = os.path.join(PACKAGE_PATH, 'resource', YOLO_CLASS_NAME_JSON)
+YOLO_MODEL_PATH = os.path.join(PACKAGE_PATH, "resource", YOLO_MODEL_FILENAME)
+YOLO_JSON_PATH = os.path.join(PACKAGE_PATH, "resource", YOLO_CLASS_NAME_JSON)
 
-class YoloModel():
+
+class YoloModel:
     def __init__(self):
         self.model = YOLO(YOLO_MODEL_PATH)
         with open(YOLO_JSON_PATH, "r", encoding="utf-8") as file:
@@ -57,6 +58,8 @@ class YoloModel():
         detections = self._aggregate_detections(results)
         label_id = self.reversed_class_dict[target]
         print("label_id: ", label_id)
+        print("detections: ", detections)
+
         matches = [d for d in detections if d["label"] == label_id]
         if not matches:
             print("No matches found for the target label.")
@@ -97,15 +100,16 @@ class YoloModel():
             scores = np.array([g["score"] for g in group])
             labels = [g["label"] for g in group]
 
-            final.append({
-                "box": boxes.mean(axis=0).tolist(),
-                "score": float(scores.mean()),
-                "label": Counter(labels).most_common(1)[0][0],
-            })
+            final.append(
+                {
+                    "box": boxes.mean(axis=0).tolist(),
+                    "score": float(scores.mean()),
+                    "label": Counter(labels).most_common(1)[0][0],
+                }
+            )
 
         return final
 
-    
     def _iou(self, box1, box2):
         """
         Compute Intersection over Union (IoU) between two boxes [x1, y1, x2, y2].

@@ -5,8 +5,8 @@ from typing import Any, Callable, Optional, Tuple
 
 from ament_index_python.packages import get_package_share_directory
 from od_msg.srv import SrvDepthPosition
-from pick_and_place_text.realsense import ImgNode
-from pick_and_place_text.yolo import YoloModel
+from object_detection.realsense import ImgNode
+from object_detection.yolo import YoloModel
 
 
 PACKAGE_NAME = 'pick_and_place_text'
