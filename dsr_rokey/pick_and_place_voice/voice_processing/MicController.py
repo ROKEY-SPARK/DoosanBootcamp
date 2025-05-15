@@ -68,7 +68,7 @@ class MicController:
             wf.setsampwidth(self.sample_width)
             wf.setframerate(self.config.rate)
             wf.writeframes(b''.join(self.frames))
-        print("✅ 파일 저장 완료!")
+        print("파일 저장 완료!")
 
     def get_wav_data(self):
         wav_buffer = io.BytesIO()
