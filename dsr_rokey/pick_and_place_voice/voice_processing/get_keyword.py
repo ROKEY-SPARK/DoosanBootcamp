@@ -1,15 +1,9 @@
 # ros2 service call /get_keyword std_srvs/srv/Trigger "{}"
 
 import os
-
-# import json
-# import base64
-# import numpy as np
 import rclpy
-from rclpy.node import Node
 import pyaudio
-
-# from langchain.schema import HumanMessage, SystemMessage
+from rclpy.node import Node
 
 from ament_index_python.packages import get_package_share_directory
 from dotenv import load_dotenv
@@ -17,8 +11,6 @@ from langchain.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 
-# from langchain_upstage import UpstageEmbeddings
-# from sklearn.metrics.pairwise import cosine_similarity
 from std_srvs.srv import Trigger
 from voice_processing.MicController import MicController, MicConfig
 
@@ -31,21 +23,21 @@ package_path = get_package_share_directory("pick_and_place_voice")
 
 is_laod = load_dotenv(dotenv_path=os.path.join(f"{package_path}/resource/.env"))
 openai_api_key = os.getenv("OPENAI_API_KEY")
-# match_data_path = os.path.join(package_path, 'resource/class_embeddings.json')
-
 
 ############ AI Processor ############
+# class AIProcessor:
+#     def __init__(self):
 
 
-class AIProcessor:
+
+############ GetKeyword Node ############
+class GetKeyword(Node):
     def __init__(self):
+
+
         self.llm = ChatOpenAI(
             model="gpt-4o", temperature=0.5, openai_api_key=openai_api_key
         )
-
-        # self.embeddings = UpstageEmbeddings(model="solar-embedding-1-large")
-        # with open(match_data_path, "r", encoding="utf-8") as file:
-        #     self.match_data = json.load(file)
 
         prompt_content = """
             당신은 사용자의 문장에서 특정 도구와 목적지를 추출해야 합니다.
@@ -93,30 +85,27 @@ class AIProcessor:
         self.lang_chain = LLMChain(llm=self.llm, prompt=self.prompt_template)
         self.stt = STT(openai_api_key=openai_api_key)
 
-    def speech2text(self, speech_data):
-        # messages = [
-        #     ("human", [
-        #         {"type": "text", "text": "Transcribe the following:"},
-        #         {"type": "input_audio", "input_audio": {"data": speech_data, "format": "wav"}},
-        #     ])
-        # ]
 
-        messages = [
-            (
-                "human",
-                [
-                    {"type": "text", "text": "Please transcribe the following audio."},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": speech_data, "format": "wav"},
-                    },
-                ],
-            )
-        ]
+        super().__init__("get_keyword_node")
+        # 오디오 설정
+        mic_config = MicConfig(
+            chunk=12000,
+            rate=48000,
+            channels=1,
+            record_seconds=5,
+            fmt=pyaudio.paInt16,
+            device_index=10,
+            buffer_size=24000,
+        )
+        self.mic_controller = MicController(config=mic_config)
+        # self.ai_processor = AIProcessor()
 
-        output_message = self.stt.invoke(messages)
-        print("output_message.content: ", output_message.content)
-        return output_message
+        self.get_logger().info("MicRecorderNode initialized.")
+        self.get_logger().info("wait for client's request...")
+        self.get_keyword_srv = self.create_service(
+            Trigger, "get_keyword", self.get_keyword
+        )
+        self.wakeup_word = WakeupWord(mic_config.buffer_size)
 
     def extract_keyword(self, output_message):
         response = self.lang_chain.invoke({"user_input": output_message})
@@ -131,55 +120,7 @@ class AIProcessor:
         print(f"object: {object}")
         print(f"target: {target}")
         return object
-
-    # def embedding_keyword(self, keword):
-    #     return np.array(self.embeddings.embed_documents(keword))
-
-    # def calculate_similarity(self, test_embedding, threshold=0.6):
-    #     """
-    #     제공된 임베딩과 사전 학습된 데이터(match_data) 간 유사도를 계산합니다.
-    #     """
-    #     similarity = {}
-    #     for class_name, class_vector in self.match_data.items():
-    #         class_vector = np.array(class_vector).reshape(1, -1)
-    #         similarity[class_name] = cosine_similarity(test_embedding, class_vector)[0][0]
-
-    #     best_match = max(similarity, key=similarity.get)
-    #     best_score = similarity[best_match]
-
-    #     # 유사도가 threshold 이하이면 None 반환
-    #     if best_score < threshold:
-    #         return None
-
-    #     return max(similarity, key=similarity.get)
-
-
-############ GetKeyword Node ############
-
-
-class GetKeyword(Node):
-    def __init__(self):
-        super().__init__("get_keyword_node")
-        # 오디오 설정
-        mic_config = MicConfig(
-            chunk=12000,
-            rate=48000,
-            channels=1,
-            record_seconds=5,
-            fmt=pyaudio.paInt16,
-            device_index=10,
-            buffer_size=24000,
-        )
-        self.mic_controller = MicController(config=mic_config)
-        self.ai_processor = AIProcessor()
-
-        self.get_logger().info("MicRecorderNode initialized.")
-        self.get_logger().info("wait for client's request...")
-        self.get_keyword_srv = self.create_service(
-            Trigger, "get_keyword", self.get_keyword
-        )
-        self.wakeup_word = WakeupWord(mic_config.buffer_size)
-
+    
     def get_keyword(self, request, response):  # 요청과 응답 객체를 받아야 함
         try:
             print("open stream")
@@ -193,28 +134,9 @@ class GetKeyword(Node):
         while not self.wakeup_word.is_wakeup():
             pass
 
-        # self.mic_controller.record_audio()
-        # wav_audio_data = self.mic_controller.get_wav_data()
-        # self.mic_controller.close_stream()
-        # print("close stream")
-
-        # audio_b64 = base64.b64encode(wav_audio_data).decode('utf-8')
-
         # STT --> Keword Extract --> Embedding
-        output_message = self.ai_processor.stt.speech2text()
-        keyword = self.ai_processor.extract_keyword(output_message)
-        # target_embedding_list = self.ai_processor.embedding_keyword(keyword)
-
-        # detected_keywords = {
-        #     self.ai_processor.calculate_similarity(target.reshape(1, -1))
-        #     for target in target_embedding_list
-        # }  # 중복 제거를 위해 set으로 저장
-
-        # if None in detected_keywords:
-        #     self.get_logger().warn("No confident match found. Please try again.")
-        #     response.success = False
-        #     response.message = "I couldn't recognize the tool. Try again."
-        #     return response
+        output_message = self.stt.speech2text()
+        keyword = self.extract_keyword(output_message)
 
         self.get_logger().warn(f"Detected tools: {keyword}")
 
